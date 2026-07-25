@@ -1,7 +1,43 @@
 // ../../packages/protocol/dist/version.js
 var PROVIDER_GLOBAL = "claude";
 
+// ../../packages/protocol/dist/storage.js
+var STORAGE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+function isValidStorageKey(key) {
+  return typeof key === "string" && STORAGE_KEY_RE.test(key);
+}
+
+// ../../packages/protocol/dist/errors.js
+var BYOPErrorCode = {
+  /** User rejected the connect/consent request. (≈ 4001) */
+  USER_REJECTED: 4001,
+  /** Origin is not connected / has no grant for this method. (≈ 4100) */
+  UNAUTHORIZED: 4100,
+  /** Method exists but the origin's scope doesn't cover it (model/tool not granted). */
+  SCOPE_EXCEEDED: 4110,
+  /** A per-action write consent was denied by the user. */
+  CONSENT_DENIED: 4120,
+  /** Budget or rate limit hit (tokens/day or calls/min). */
+  BUDGET_EXCEEDED: 4290,
+  /** Unknown method. (≈ 4200) */
+  UNSUPPORTED_METHOD: 4200,
+  /** Bad params. (≈ -32602) */
+  INVALID_PARAMS: -32602,
+  /** The sidekick daemon is not installed / not reachable. The SDK maps this to its
+   *  "install the sidekick" fallback. */
+  PROVIDER_UNAVAILABLE: 4900,
+  /** Backend error (model/tool failed for a non-policy reason). */
+  BACKEND_ERROR: 4500
+};
+
 // ../../packages/sdk/dist/connect-chip.js
+function rungFromError(e) {
+  if (e?.code !== BYOPErrorCode.PROVIDER_UNAVAILABLE)
+    return null;
+  return e?.data?.reason === "unpaired" ? { kind: "unpaired" } : { kind: "unreachable" };
+}
+var CHROME_STORE_URL = "https://chromewebstore.google.com/detail/injmjolmnekmahlnackakiamjepegagb";
+var RELAY_DMG_URL = "https://github.com/sameeeeeeep/switchboard/releases/latest/download/Relay.dmg";
 var STYLE = `
 :host { all: initial; }
 * { box-sizing: border-box; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
@@ -46,6 +82,11 @@ var STYLE = `
   background: transparent; color: #B4BECE; font-size: 13px; font-weight: 500; cursor: pointer; }
 .menu .item:hover { background: #20262F; color: #E8EDF4; }
 .menu .foot { padding: 8px 10px 4px; font-size: 11px; font-weight: 500; color: #6E7C90; line-height: 1.4; }
+/* Setup-ladder pills (sidekick asleep / unpaired): quiet and informative, never red \u2014 nothing is
+   broken. Amber only while the daemon is unreachable; the glyph stays muted until it's reachable. */
+.dot { width: 7px; height: 7px; border-radius: 50%; background: #E8B84B; flex: none;
+  box-shadow: 0 0 8px rgba(232,184,75,.45); }
+.menu .body { padding: 8px 10px 2px; font-size: 12px; font-weight: 500; color: #B4BECE; line-height: 1.45; }
 `;
 function mountConnect(target, opts = {}) {
   const installUrl = opts.installUrl ?? "https://thelastprompt.ai/switchboard/";
@@ -64,8 +105,8 @@ function mountConnect(target, opts = {}) {
   let relay = null;
   let seq = 0;
   let wasConnected = false;
+  let lastProjectKey;
   let sessionDisconnected = false;
-  let upgradeAsked = false;
   const onDocClick = (e) => {
     if (menuOpen && !host.contains(e.target)) {
       menuOpen = false;
@@ -73,6 +114,20 @@ function mountConnect(target, opts = {}) {
     }
   };
   document.addEventListener("click", onDocClick);
+  const initEvent = `${PROVIDER_GLOBAL}#initialized`;
+  let lateWatching = false;
+  const onLateInit = () => {
+    lateWatching = false;
+    window.removeEventListener(initEvent, onLateInit);
+    if (!destroyed)
+      void refresh();
+  };
+  function watchForLateProvider() {
+    if (lateWatching || destroyed)
+      return;
+    lateWatching = true;
+    window.addEventListener(initEvent, onLateInit);
+  }
   function el2(tag, cls, text2) {
     const n = document.createElement(tag);
     if (cls)
@@ -87,29 +142,42 @@ function mountConnect(target, opts = {}) {
     if (destroyed || my !== seq)
       return;
     if (!(r instanceof Relay)) {
+      watchForLateProvider();
       state2 = { kind: "not-installed", installUrl };
       return render();
     }
     relay = r;
     subscribe(r);
-    let grant = sessionDisconnected ? null : await r.permissions().catch(() => null);
+    const h = await r.health();
     if (destroyed || my !== seq)
       return;
-    if (!grant) {
-      state2 = { kind: "disconnected", relay: r };
+    if (h && !h.reachable) {
+      state2 = { kind: "unreachable", appMissing: h.installedHere === false };
       emitTransition(false);
       return render();
     }
-    const wanted = opts.scope?.contextKinds ?? [];
-    const granted = grant.contextKinds;
-    const covered = Array.isArray(granted) && (granted.length === 0 || wanted.every((k) => granted.includes(k)));
-    if (wanted.length && !covered && !upgradeAsked) {
-      upgradeAsked = true;
-      const upgraded = await r.connect(opts.scope).catch(() => null);
-      if (destroyed || my !== seq)
-        return;
-      if (upgraded)
-        grant = upgraded;
+    if (h && !h.paired) {
+      state2 = { kind: "unpaired" };
+      emitTransition(false);
+      return render();
+    }
+    let permErr = null;
+    const grant = sessionDisconnected ? null : await r.permissions().catch((e) => {
+      permErr = e;
+      return null;
+    });
+    if (destroyed || my !== seq)
+      return;
+    if (!grant) {
+      const rung = !h ? rungFromError(permErr) : null;
+      if (rung) {
+        state2 = rung;
+        emitTransition(false);
+        return render();
+      }
+      state2 = { kind: "disconnected", relay: r };
+      emitTransition(false);
+      return render();
     }
     const wantsContext = opts.context !== "none";
     const [user, project] = await Promise.all([
@@ -118,8 +186,13 @@ function mountConnect(target, opts = {}) {
     ]);
     if (destroyed || my !== seq)
       return;
+    const wasAlreadyConnected = wasConnected;
     state2 = { kind: "connected", relay: r, user, project };
     emitTransition(true);
+    const projKey = project ? project.id ?? project.name : null;
+    if (wasAlreadyConnected && lastProjectKey !== void 0 && projKey !== lastProjectKey)
+      opts.onProjectChange?.(project);
+    lastProjectKey = projKey;
     render();
   }
   function emitTransition(connected) {
@@ -142,6 +215,9 @@ function mountConnect(target, opts = {}) {
     r.on("disconnect", () => {
       void refresh();
     });
+    r.on("health", () => {
+      void refresh();
+    });
   }
   async function doConnect() {
     if (!relay)
@@ -150,7 +226,19 @@ function mountConnect(target, opts = {}) {
       sessionDisconnected = false;
       await relay.connect(opts.scope);
       await refresh();
-    } catch {
+    } catch (e) {
+      const err = e;
+      if (err?.code !== BYOPErrorCode.PROVIDER_UNAVAILABLE)
+        return;
+      await refresh();
+      if (state2.kind === "disconnected") {
+        const rung = rungFromError(err);
+        if (rung) {
+          state2 = rung;
+          emitTransition(false);
+          render();
+        }
+      }
     }
   }
   async function doPick() {
@@ -158,8 +246,7 @@ function mountConnect(target, opts = {}) {
       return;
     menuOpen = false;
     render();
-    const project = await relay.context.pick().catch(() => null);
-    opts.onProjectChange?.(project);
+    await relay.context.pick().catch(() => null);
     await refresh();
   }
   async function doDisconnect() {
@@ -178,10 +265,104 @@ function mountConnect(target, opts = {}) {
     if (state2.kind === "booting")
       return;
     if (state2.kind === "not-installed") {
+      const url = state2.installUrl;
+      const wrap2 = el2("div", "wrap");
       const b = el2("button", "btn get");
       b.append(el2("span", "glyph"), el2("span", void 0, "Get Switchboard"), el2("span", "arr", "\u2197"));
-      b.onclick = () => window.open(state2.kind === "not-installed" ? state2.installUrl : installUrl, "_blank", "noopener");
-      mount.append(b);
+      b.onclick = (e) => {
+        e.stopPropagation();
+        menuOpen = !menuOpen;
+        render();
+      };
+      wrap2.append(b);
+      if (menuOpen) {
+        const menu = el2("div", "menu");
+        menu.append(el2("div", "body", "Two parts: the Chrome extension, then Relay for Mac."));
+        const store = el2("button", "item", "1 \xB7 Add to Chrome \u2197");
+        store.onclick = () => {
+          menuOpen = false;
+          render();
+          window.open(CHROME_STORE_URL, "_blank", "noopener");
+        };
+        const guide = el2("button", "item", "2 \xB7 Get Relay for Mac \u2197");
+        guide.onclick = () => {
+          menuOpen = false;
+          render();
+          window.open(url, "_blank", "noopener");
+        };
+        menu.append(store, guide);
+        wrap2.append(menu);
+      }
+      mount.append(wrap2);
+      return;
+    }
+    if (state2.kind === "unreachable") {
+      const appMissing = state2.appMissing === true;
+      const wrap2 = el2("div", "wrap");
+      const b = el2("button", "btn get");
+      b.append(el2("span", "glyph"), el2("span", void 0, appMissing ? "Get Relay for Mac" : "Your sidekick is asleep"), el2("span", appMissing ? "arr" : "dot", appMissing ? "\u2197" : void 0), ...appMissing ? [] : [el2("span", "caret", "\u25BE")]);
+      b.onclick = (e) => {
+        e.stopPropagation();
+        menuOpen = !menuOpen;
+        render();
+      };
+      wrap2.append(b);
+      if (menuOpen) {
+        const menu = el2("div", "menu");
+        if (appMissing) {
+          menu.append(el2("div", "body", "Extension \u2713 \u2014 now the other half: Relay, the Mac app that holds your Claude."));
+          const dl = el2("button", "item", "Download Relay.dmg \u2197");
+          dl.onclick = () => {
+            menuOpen = false;
+            render();
+            window.open(RELAY_DMG_URL, "_blank", "noopener");
+          };
+          menu.append(dl, el2("div", "sep"));
+        } else {
+          menu.append(el2("div", "body", "Open the Relay menubar app to wake it."));
+          const retry = el2("button", "item", "Retry");
+          retry.onclick = () => {
+            menuOpen = false;
+            render();
+            void refresh();
+          };
+          menu.append(retry, el2("div", "sep"));
+        }
+        const setup = el2("button", "item", "New here? Full setup \u2197");
+        setup.onclick = () => {
+          menuOpen = false;
+          render();
+          window.open(installUrl, "_blank", "noopener");
+        };
+        menu.append(setup);
+        wrap2.append(menu);
+      }
+      mount.append(wrap2);
+      return;
+    }
+    if (state2.kind === "unpaired") {
+      const wrap2 = el2("div", "wrap");
+      const b = el2("button", "btn connect");
+      b.append(el2("span", "glyph"), el2("span", void 0, "Almost there \u2014 pair in the side panel"), el2("span", "caret", "\u25BE"));
+      b.onclick = (e) => {
+        e.stopPropagation();
+        menuOpen = !menuOpen;
+        render();
+      };
+      wrap2.append(b);
+      if (menuOpen) {
+        const menu = el2("div", "menu");
+        menu.append(el2("div", "body", "Click the Switchboard icon in your Chrome toolbar and paste your pairing token."));
+        const retry = el2("button", "item", "Retry");
+        retry.onclick = () => {
+          menuOpen = false;
+          render();
+          void refresh();
+        };
+        menu.append(retry);
+        wrap2.append(menu);
+      }
+      mount.append(wrap2);
       return;
     }
     if (state2.kind === "disconnected") {
@@ -241,12 +422,23 @@ function mountConnect(target, opts = {}) {
     destroy: () => {
       destroyed = true;
       document.removeEventListener("click", onDocClick);
+      window.removeEventListener(initEvent, onLateInit);
       host.remove();
     }
   };
 }
 
 // ../../packages/sdk/dist/index.js
+var warnedStorageKeys = /* @__PURE__ */ new Set();
+function warnBadStorageKey(key) {
+  if (isValidStorageKey(key) || warnedStorageKeys.has(key))
+    return;
+  warnedStorageKeys.add(key);
+  const suggestion = String(key).replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "") || "key";
+  console.warn(`[relay.storage] invalid key ${JSON.stringify(key)} \u2014 this write/read WILL be rejected by the daemon and silently do nothing.
+  Keys map 1:1 to files (<key>.json) in this origin's folder, so they must match ${STORAGE_KEY_RE}.
+  ":" is not allowed (illegal on NTFS; "a:b" is Alternate Data Stream syntax on Windows). Try ${JSON.stringify(suggestion)}.`);
+}
 var Relay = class {
   provider;
   constructor(provider) {
@@ -268,6 +460,17 @@ var Relay = class {
   }
   permissions() {
     return this.provider.request({ method: "claude_permissions" });
+  }
+  /** The setup-ladder snapshot (reachable/paired/connected), answered by the EXTENSION from its
+   *  own state — never the daemon — so it resolves fast (<1s) in every degraded state, including
+   *  the ones where every other method would hang. Resolves null when the extension is too old to
+   *  know `claude_health` (or its worker is unreachable): callers MUST treat null as "unknown"
+   *  and fall back to probing permissions() exactly as before — that skew guard is load-bearing
+   *  while store users run an older extension against newer app bundles. */
+  health() {
+    const answer = this.provider.request({ method: "claude_health" }).catch(() => null);
+    const timer = new Promise((resolve2) => setTimeout(() => resolve2(null), 1500));
+    return Promise.race([answer, timer]);
   }
   /** The paired user's public identity (name/avatar), or null if unavailable. Convenience over
    *  capabilities().user — what the connect chip greets with ("Hi Sameep"). */
@@ -338,14 +541,23 @@ var Relay = class {
    */
   get storage() {
     const req = (params) => this.provider.request({ method: "claude_storage", params });
+    const k = (key) => {
+      warnBadStorageKey(key);
+      return key;
+    };
     return {
-      get: (key) => req({ op: "get", key }).then((r) => r.value ?? null),
-      set: (key, value) => req({ op: "set", key, value }).then(() => void 0),
-      delete: (key) => req({ op: "delete", key }).then((r) => r.ok),
+      get: (key) => req({ op: "get", key: k(key) }).then((r) => r.value ?? null),
+      set: (key, value) => req({ op: "set", key: k(key), value }).then(() => void 0),
+      delete: (key) => req({ op: "delete", key: k(key) }).then((r) => r.ok),
       list: () => req({ op: "list" }).then((r) => r.keys ?? []),
       info: () => req({ op: "info" }).then((r) => r.info),
       /** Point this app's store at a real folder (triggers a path-consent click). */
-      bind: (path) => req({ op: "bind", path }).then((r) => r.info)
+      bind: (path) => req({ op: "bind", path }).then((r) => r.info),
+      /** Open a NATIVE folder chooser on the daemon's machine (macOS today). The user picking a
+       *  folder in an OS dialog that names this origin IS the path consent, so a successful pick
+       *  comes back already bound. Resolves undefined on cancel or when no native picker exists —
+       *  keep a typed-path `bind` as the fallback UI. */
+      pick: (reason) => req({ op: "pick", reason }).then((r) => r.info).catch(() => void 0)
     };
   }
   /**
@@ -585,6 +797,7 @@ function facetPrompt(account, facet) {
 }
 
 // src/cast/state.js
+var ACCOUNT_PREFIX = "account-";
 var newId = () => "a_" + Math.random().toString(36).slice(2, 9);
 var safeParse = (s) => {
   try {
@@ -617,7 +830,7 @@ function blankAccount() {
 }
 async function loadAccounts(relay) {
   try {
-    const keys = (await relay.storage.list()).filter((k) => k.startsWith("account:"));
+    const keys = (await relay.storage.list()).filter((k) => k.startsWith(ACCOUNT_PREFIX));
     const raw = await Promise.all(keys.map((k) => relay.storage.get(k)));
     return raw.map(safeParse).filter(Boolean).map(migrate).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   } catch {
@@ -627,7 +840,7 @@ async function loadAccounts(relay) {
 async function persist(relay, a) {
   a.updatedAt = Date.now();
   try {
-    await relay.storage.set("account:" + a.id, JSON.stringify(a));
+    await relay.storage.set(ACCOUNT_PREFIX + a.id, JSON.stringify(a));
     if (a.assets?.face?.approved && a.foundation?.locks?.persona) {
       await relay.context.publish({ id: a.id, name: personaName(a), kind: "persona", data: personaContext(a) });
     }
@@ -980,8 +1193,10 @@ var clear = (node) => {
   return node;
 };
 function optionCard(card, opts = {}) {
-  const c = el("button", "opt" + (card.recommended ? " rec" : "") + (opts.selected ? " sel" : ""));
-  if (card.recommended && !opts.selected) c.append(el("span", "rb", "RECOMMENDED"));
+  const drafted = !!opts.drafted && !opts.selected;
+  const c = el("button", "opt" + (card.recommended && !drafted ? " rec" : "") + (drafted ? " draft" : "") + (opts.selected ? " sel" : ""));
+  if (drafted) c.append(el("span", "rb draft", "CAST'S PICK"));
+  else if (card.recommended && !opts.selected) c.append(el("span", "rb", "RECOMMENDED"));
   if (opts.selected) c.append(el("span", "rb sel", "LOCKED \u2713"));
   c.append(el("div", "nm", card.title));
   if (card.subtitle) c.append(el("div", "ni", card.subtitle));
@@ -1015,7 +1230,7 @@ function optionCard(card, opts = {}) {
     }
     c.append(m);
   }
-  c.append(el("div", "use", opts.selected ? "Locked" : opts.pickLabel || "Lock this \u2192"));
+  c.append(el("div", "use", opts.selected ? "Locked" : drafted ? opts.draftLabel || "Confirm this \u2713" : opts.pickLabel || "Lock this \u2192"));
   if (opts.onPick) c.onclick = () => opts.onPick(card);
   return c;
 }
@@ -1025,7 +1240,7 @@ function optionGrid(cards, opts = {}) {
     box.append(el("div", "empty-note", opts.empty || "No options yet."));
     return box;
   }
-  for (const card of cards) box.append(optionCard(card, { ...opts, selected: opts.isSelected?.(card) }));
+  for (const card of cards) box.append(optionCard(card, { ...opts, selected: opts.isSelected?.(card), drafted: opts.isDrafted?.(card) }));
   return box;
 }
 function steer({ placeholder, value = "", cta = "Generate", onSubmit, chips = [], onChip }) {
@@ -1154,18 +1369,26 @@ function renderReference(root, ctx) {
     chips: ["a Gen-Z skincare creator in Lisbon", "a streetwear sneakerhead in Seoul", "a cozy home-cook mum", "a no-BS fitness coach", "a minimalist interiors creator"],
     onSubmit: (v) => {
       r.brief = v;
+      ctx.save();
       ground(v);
     },
     onChip: (v) => {
       r.brief = v;
+      ctx.save();
       ctx.rerender();
     }
   });
   card.append(brief);
   const g2 = el("div", "grid2");
   g2.style.marginTop = "14px";
-  g2.append(field("Niche", r.niche, "sustainable skincare", (v) => r.niche = v));
-  g2.append(field("Mood / direction", r.moodNotes, "warm, unhurried, label-reading", (v) => r.moodNotes = v));
+  g2.append(field("Niche", r.niche, "sustainable skincare", (v) => {
+    r.niche = v;
+    ctx.save();
+  }));
+  g2.append(field("Mood / direction", r.moodNotes, "warm, unhurried, label-reading", (v) => {
+    r.moodNotes = v;
+    ctx.save();
+  }));
   card.append(g2);
   root.append(card);
   const insp = el("div", "card");
@@ -1178,6 +1401,7 @@ function renderReference(root, ctx) {
     const x = el("button", "ix", "\xD7");
     x.onclick = () => {
       r.inspirations.splice(i, 1);
+      ctx.save();
       ctx.rerender();
     };
     chip.append(x);
@@ -1187,6 +1411,7 @@ function renderReference(root, ctx) {
     if (!v) return;
     r.inspirations = r.inspirations || [];
     r.inspirations.push({ handle: v.startsWith("@") || v.length < 24 ? v : v, note: "" });
+    ctx.save();
     ctx.rerender();
   } });
   insp.append(list, add);
@@ -1194,16 +1419,20 @@ function renderReference(root, ctx) {
   root.append(gateBar(a, "reference", ctx.go));
   const confirm = el("div", "confirmrow");
   const btn = el("button", r.locked ? "ghost" : "primary", r.locked ? "Brief locked \u2713 \u2014 edit above to re-ground" : "Confirm brief & begin \u2192");
+  const cerr = el("span", "note danger");
+  cerr.hidden = true;
   btn.onclick = () => {
     if (!r.brief && !r.niche) {
-      alert("Give Cast a brief or a niche to ground the account.");
+      cerr.textContent = "Give Cast a brief or a niche to ground the account.";
+      cerr.hidden = false;
       return;
     }
+    cerr.hidden = true;
     r.locked = true;
     ctx.save();
     ctx.go("foundation");
   };
-  confirm.append(btn);
+  confirm.append(btn, cerr);
   root.append(confirm);
   async function ground(v) {
     if (ctx.mock) {
@@ -1212,6 +1441,7 @@ function renderReference(root, ctx) {
       ctx.rerender();
       return;
     }
+    if (!ctx.relay) return;
     brief._btn.disabled = true;
     brief._btn.textContent = "Reading the niche\u2026";
     try {
@@ -1245,11 +1475,14 @@ function renderEntry(root, ctx) {
   }
   card.append(seg);
   if (entryMode === "describe") {
+    const chips = ["a Gen-Z skincare creator in Lisbon", "a streetwear sneakerhead in Seoul", "a cozy home-cook mum", "a no-BS fitness coach", "a minimalist interiors creator"];
+    const b = ctx.account.brand || ctx.brand;
+    const derived = b ? `an independent creator making content for ${b.name}${b.data?.positioning || b.data?.tagline ? " \u2014 " + (b.data.positioning || b.data.tagline) : ""}` : "";
     card.append(steer({
       placeholder: "Describe the account in a line \u2014 'a plain-spoken skincare creator in Lisbon'",
-      value: r.brief,
+      value: r.brief || derived || chips[0],
       cta: "\u2728 Make it \u2192",
-      chips: ["a Gen-Z skincare creator in Lisbon", "a streetwear sneakerhead in Seoul", "a cozy home-cook mum", "a no-BS fitness coach", "a minimalist interiors creator"],
+      chips,
       onSubmit: (v) => {
         if (v) begin(ctx, { brief: v });
       }
@@ -1348,6 +1581,7 @@ async function groundInBackground(ctx) {
     ctx.rerender();
     return;
   }
+  if (!ctx.relay) return;
   try {
     const attachments = r.fromPhoto && a.assets.face?.url ? [{ handle: "face", filename: "face.png", contentType: "image/png", dataUrl: a.assets.face.url }] : void 0;
     const ask = attachments ? `A founder photographed the person their new Instagram account is built around (attached as "face").${r.brief ? ` The founder says: "${r.brief}".` : ""} Study the photo. ` : `A founder wants to build an Instagram account: "${r.brief}".${r.inspirations?.length ? " Reference accounts they admire: " + r.inspirations.map((i) => i.handle).join(", ") + "." : ""} Use WebSearch to understand this corner of Instagram. `;
@@ -1376,10 +1610,11 @@ function renderFoundation(root, ctx) {
 function facetCard(facet, ctx) {
   const a = ctx.account, fnd = a.foundation;
   const status = facetStatus(a, facet.id, ctx.loading);
+  const drafted = !!fnd.auto[facet.id] && !!fnd.locks[facet.id];
   const card = el("div", "card facet " + status);
   const head = el("div", "fhead");
   const title = el("div", "ft");
-  title.append(el("span", "fname", facet.title), el("span", "fstatus " + status, status));
+  title.append(el("span", "fname", facet.title), el("span", "fstatus " + (drafted ? "drafted" : status), drafted ? "drafted" : status));
   head.append(title);
   const lock = fnd.locks[facet.id];
   if (facetUnlocked(a, facet.id)) {
@@ -1404,14 +1639,18 @@ function facetCard(facet, ctx) {
   let cards = genCards || [];
   for (const c of [lock, ...fnd.more[facet.id] || []].filter(Boolean)) if (!cards.some((x) => x.id === c.id)) cards = [c, ...cards];
   if (!cards.length) {
-    card.append(el("div", "empty-note", genCards ? "Nothing came back \u2014 steer below and regenerate, or write your own." : "Generate options to choose a direction."));
+    const offline = !ctx.mock && !ctx.relay;
+    card.append(el("div", "empty-note", offline ? "Switchboard disconnected \u2014 reconnect from the chip to keep generating." : genCards ? "Nothing came back \u2014 steer below and regenerate, or write your own." : "Generate options to choose a direction."));
     card.append(steerRow(facet, ctx, status));
     return card;
   }
   const picked = new Set([lock?.id, ...(fnd.more[facet.id] || []).map((c) => c.id)].filter(Boolean));
   const grid = optionGrid(cards, {
-    isSelected: (c) => picked.has(c.id),
+    // accent + LOCKED only for a human's own pick; Cast's autopilot pick stays a neutral draft.
+    isSelected: (c) => picked.has(c.id) && !drafted,
+    isDrafted: (c) => picked.has(c.id) && drafted,
     pickLabel: facet.select === "many" ? "Add pillar +" : "Lock this \u2192",
+    draftLabel: facet.select === "many" ? "Drafted \xB7 tap to drop" : "Confirm this \u2713",
     onPick: (c) => {
       relock(a, facet.id, c);
       ctx.save();
@@ -1420,9 +1659,23 @@ function facetCard(facet, ctx) {
   });
   card.append(grid);
   card.append(steerRow(facet, ctx, status));
-  if (lock && fnd.auto[facet.id]) card.append(el("div", "note", "\u2728 Cast locked the recommended direction \u2014 tap another card, steer, or write your own to overrule it."));
+  if (lock && drafted) card.append(draftBar(facet, ctx));
   if (facet.select === "many" && picked.size) card.append(el("div", "note", `${picked.size} pillar${picked.size === 1 ? "" : "s"} picked \u2014 lock 3-4 for a strong calendar.`));
   return card;
+}
+function draftBar(facet, ctx) {
+  const a = ctx.account, fnd = a.foundation;
+  const bar = el("div", "draftbar");
+  const t = el("div", "dbt");
+  t.append(el("b", null, "\u2728 Cast's pick \u2014 drafted, not locked."), document.createTextNode(" Confirm it, or pick another card above, steer the options, or write your own."));
+  const ok = el("button", "okbtn", facet.select === "many" ? "Confirm these \u2713" : "Confirm this \u2713");
+  ok.onclick = () => {
+    delete fnd.auto[facet.id];
+    ctx.save();
+    ctx.rerender();
+  };
+  bar.append(t, ok);
+  return bar;
 }
 function steerRow(facet, ctx, status) {
   const a = ctx.account, fnd = a.foundation;
@@ -1432,6 +1685,7 @@ function steerRow(facet, ctx, status) {
   const inp = Object.assign(el("input"), { type: "text", placeholder: facet.steer || "Steer the options, or write your own\u2026", value: steers[facet.id] || "" });
   inp.addEventListener("input", () => {
     steers[facet.id] = inp.value;
+    ctx.save();
   });
   const reg = el("button", "mini", "\u21BB Steer options");
   reg.disabled = status === "researching";
@@ -1474,6 +1728,7 @@ function relock(a, facetId, card) {
 }
 async function runFacet(facet, ctx) {
   const a = ctx.account;
+  if (!ctx.mock && !ctx.relay) return;
   ctx.loading.add(facet.id);
   ctx.rerender();
   try {
@@ -1523,8 +1778,10 @@ function assetCard(spec, vals, ctx) {
     const cur = a.assets[spec.id];
     const box = el("div", "assetone");
     const well = el("div", "assetwell" + (cur?.status === "gen" ? " load" : ""));
-    if (cur?.status === "gen") well.append(el("div", "scan"));
-    else if (cur?.url) well.append(Object.assign(el("img"), { src: cur.url }));
+    if (cur?.status === "gen") {
+      if (cur.url) well.append(Object.assign(el("img"), { src: cur.url }));
+      well.append(el("div", "scan"));
+    } else if (cur?.url) well.append(Object.assign(el("img"), { src: cur.url }));
     else well.append(el("span", "ph", "\u2728"));
     box.append(well);
     const side = el("div", "assetside");
@@ -1534,7 +1791,7 @@ function assetCard(spec, vals, ctx) {
     g.disabled = cur?.status === "gen";
     g.onclick = () => genAsset(spec, seed, ctx);
     btns.append(g);
-    if (cur?.url && !cur.approved) {
+    if (cur?.url && !cur.approved && cur.status !== "gen") {
       const ok = el("button", "okbtn", "Approve \u2713");
       ok.onclick = () => {
         cur.approved = true;
@@ -1545,6 +1802,7 @@ function assetCard(spec, vals, ctx) {
     }
     if (cur?.approved) btns.append(el("span", "saved show", "Approved \u2713"));
     side.append(btns);
+    if (cur?.error) side.append(el("div", "note danger", cur.error));
     box.append(side);
     card.append(box);
   } else {
@@ -1553,7 +1811,10 @@ function assetCard(spec, vals, ctx) {
     list.forEach((asset, i) => {
       const tile = el("div", "tile" + (asset.status === "gen" ? " load" : "") + (asset.approved ? " ok" : ""));
       if (asset.status === "gen") tile.append(el("div", "scan"));
-      else {
+      else if (!asset.url) {
+        const ph = el("div", "img");
+        tile.append(ph, el("div", "lb", "failed \u2014 \xD7 to remove"));
+      } else {
         tile.append(Object.assign(el("img", "img"), { src: asset.url }));
         tile.append(el("div", "lb", asset.name || spec.title));
       }
@@ -1585,13 +1846,15 @@ function assetCard(spec, vals, ctx) {
 }
 async function genAsset(spec, seed, ctx) {
   const a = ctx.account;
-  const rec = { id: newId(), status: "gen", approved: false, prompt: seed, name: spec.title };
+  if (!ctx.mock && !ctx.relay) return;
+  const prev = spec.one ? a.assets[spec.id] : null;
+  const rec = spec.one ? { ...prev || {}, id: newId(), status: "gen", approved: false, prompt: seed, name: spec.title, error: null } : { id: newId(), status: "gen", approved: false, prompt: seed, name: spec.title };
   if (spec.one) a.assets[spec.id] = rec;
   else (a.assets[spec.id] = a.assets[spec.id] || []).push(rec);
   ctx.rerender();
   const bseed = brandStyle(a) ? `${seed}, ${brandStyle(a)}` : seed;
+  let url = null;
   try {
-    let url;
     if (ctx.mock) {
       await wait(800);
       url = svgTile(spec.title, ...COLORS[Math.floor(Math.random() * COLORS.length)]);
@@ -1601,10 +1864,18 @@ async function genAsset(spec, seed, ctx) {
       const refs = a.assets.face?.url ? [{ handle: "face", filename: "face.png", url: a.assets.face.url }] : [];
       url = refs.length ? await generateOnModel(ctx.relay, bseed, "1:1", refs, null, MODELS.shot) : await generateImage(ctx.relay, bseed, "1:1", MODELS.shot);
     }
-    rec.url = url;
-    rec.status = url ? "done" : "fail";
   } catch {
+    url = null;
+  }
+  if (url) {
+    rec.url = url;
+    rec.status = "done";
+    rec.approved = false;
+    rec.error = null;
+  } else if (spec.one && prev?.url) a.assets[spec.id] = { ...prev, error: "Regeneration failed \u2014 kept the previous image." };
+  else {
     rec.status = "fail";
+    if (spec.one) rec.error = "Generation failed \u2014 try again.";
   }
   ctx.save();
   ctx.rerender();
@@ -1677,13 +1948,15 @@ function slotRow(s, ctx) {
 }
 async function proposePlan(ctx) {
   const a = ctx.account;
+  if (!ctx.mock && !ctx.relay) return;
   ctx.loading.add("plan");
   ctx.rerender();
   try {
     const pillars = pillarList(a).map((p) => p.title);
+    const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
     const props = ctx.mock ? mockPlan(a) : await generateCards(
       ctx.relay,
-      `You are a social strategist for ${personaName(a)}, an account in ${a.reference.niche || "its niche"} (voice: ${a.foundation.locks.voice?.title || "n/a"}). ` + (brandLine(a) ? brandLine(a) + " Weave the brand in naturally where it fits, never forced. " : "") + `Pillars: ${pillars.join(", ") || "general"}. Use WebSearch for what's trending right now. Propose 6 specific posts spread over the next few weeks. Reply with ONLY a JSON array of {"title","angle","pillar","source","date":"2026-07-DD"}.`,
+      `You are a social strategist for ${personaName(a)}, an account in ${a.reference.niche || "its niche"} (voice: ${a.foundation.locks.voice?.title || "n/a"}). ` + (brandLine(a) ? brandLine(a) + " Weave the brand in naturally where it fits, never forced. " : "") + `Pillars: ${pillars.join(", ") || "general"}. Use WebSearch for what's trending right now. Propose 6 specific posts spread over the next few weeks. Reply with ONLY a JSON array of {"title","angle","pillar","source","date":"YYYY-MM-DD"} \u2014 real future dates within 3 weeks starting from ${today}.`,
       { web: true }
     );
     a.calendar._proposed = [...a.calendar._proposed || [], ...props.map((c) => ({ title: c.title, angle: c.body || c.angle, pillar: c.chips?.[0] || c.pillar, source: c.subtitle || c.source, date: c.date }))];
@@ -1749,6 +2022,7 @@ function scriptCard(slot, ctx) {
 }
 async function writeScript(slot, ctx) {
   const a = ctx.account;
+  if (!ctx.mock && !ctx.relay) return;
   ctx.loading.add("script:" + slot.id);
   ctx.rerender();
   try {
@@ -1757,6 +2031,20 @@ async function writeScript(slot, ctx) {
       `Write a short-form vertical video script for ${personaName(a)} (voice: ${a.foundation.locks.voice?.title || "natural"}). ` + (brandLine(a) ? brandLine(a) + " If the brand fits the topic, feature it authentically; otherwise leave it out. " : "") + `Topic: ${slot.title}. ${slot.angle || ""}. 4 beats: hook, two middles, CTA. Each beat: {"shot": what we see on-location, "line": what they say in their voice}. Reply with ONLY a JSON array of {"shot","line"}.`
     ).then((cards) => cards.map((c) => ({ shot: c.title, line: c.body || "" })));
     a.scripts[slot.id] = { beats, approved: false, status: "written" };
+    const prevProd = a.productions?.[slot.id];
+    if (prevProd) {
+      a.productions[slot.id] = {
+        ...prevProd,
+        shots: beats.map((b, i) => {
+          const o = prevProd.shots?.[i];
+          return o && o.desc === b.shot ? { ...o, line: b.line } : { id: newId(), desc: b.shot, line: b.line, url: null, status: "idle", approved: false };
+        }),
+        stitchedUrl: null,
+        approved: false,
+        status: "idle",
+        error: null
+      };
+    }
   } catch {
     if (!(slot.id in a.scripts)) a.scripts[slot.id] = null;
   }
@@ -1778,7 +2066,7 @@ function produceCard(slot, ctx) {
   const prod = a.productions[slot.id] || (a.productions[slot.id] = { shots: sc.beats.map((b, i) => ({ id: newId(), desc: b.shot, line: b.line, url: null, status: "idle", approved: false })), stitchedUrl: null, approved: false, status: "idle" });
   const card = el("div", "card");
   card.append(el("span", "eyebrow", slot.title));
-  card.append(el("div", "fblurb", "Storyboard \u2014 one still per beat (nano-banana keyframes). Approve them, then render each into a real video clip on your locked face + voice."));
+  card.append(el("div", "fblurb", "Storyboard \u2014 one still per beat (nano-banana keyframes). Approve them, then render each into a real video clip on your locked face, narrated beat by beat."));
   const strip = el("div", "filmstrip");
   prod.shots.forEach((shot, i) => {
     const frame = el("div", "frame" + (shot.status === "gen" ? " load" : "") + (shot.approved ? " ok" : ""));
@@ -1810,7 +2098,9 @@ function produceCard(slot, ctx) {
   });
   card.append(strip);
   const foot = el("div", "confirmrow");
-  const shootAll = el("button", "ghost", "\u2728 Generate storyboard");
+  const anyShotGen = prod.shots.some((s) => s.status === "gen");
+  const shootAll = el("button", "ghost", anyShotGen ? "Shooting\u2026" : "\u2728 Generate storyboard");
+  shootAll.disabled = anyShotGen;
   shootAll.onclick = () => shootAll_(slot, ctx);
   foot.append(shootAll);
   const approvedShots = prod.shots.filter((s) => s.approved && s.url).length;
@@ -1825,20 +2115,39 @@ function produceCard(slot, ctx) {
   rd.append(el("p", "empty-note", "Paste a reference reel whose energy you like. Cast makes a NEW clip that follows its pacing on your locked persona \u2014 video \u2192 video, one shot, no shot-by-shot."));
   const rrow = el("div", "confirmrow");
   const inp = Object.assign(el("input"), { type: "text", placeholder: "https://\u2026/reference-reel.mp4", value: prod.refUrl || "" });
-  inp.addEventListener("input", () => prod.refUrl = inp.value);
+  inp.addEventListener("input", () => {
+    prod.refUrl = inp.value;
+    ctx.save();
+  });
   const rbtn = el("button", "ghost", prod.refStatus === "gen" ? "Driving\u2026" : "\u{1F3AC} Generate from reference");
-  rbtn.disabled = prod.refStatus === "gen" || !a.assets.face?.url;
-  rbtn.onclick = () => driveFromRef(slot, ctx, inp.value.trim());
+  rbtn.disabled = prod.refStatus === "gen" || prod.status === "stitch";
+  const rerr = el("div", "note danger");
+  rerr.hidden = true;
+  rbtn.onclick = () => {
+    const u = inp.value.trim();
+    if (!u) {
+      rerr.textContent = "Paste a reference reel URL to drive from.";
+      rerr.hidden = false;
+      return;
+    }
+    if (!a.assets.face?.url) {
+      rerr.textContent = "Approve a face first \u2014 it's the identity we keep.";
+      rerr.hidden = false;
+      return;
+    }
+    rerr.hidden = true;
+    driveFromRef(slot, ctx, u);
+  };
   rrow.append(inp, rbtn);
-  rd.append(rrow);
+  rd.append(rrow, rerr);
   card.append(rd);
   const shownShots = prod.shots.filter((s) => s.url);
-  if (shownShots.length || prod.status === "stitch") renderReel(card, slot, ctx, prod, sc);
+  if (shownShots.length || prod.status === "stitch" || prod.error) renderReel(card, slot, ctx, prod, sc);
   return card;
 }
 function renderReel(card, slot, ctx, prod, sc) {
   const a = ctx.account, beats = sc.beats;
-  const hasVideo = prod.stitchedUrl && !prod.stitchedUrl.startsWith("data:image");
+  const hasVideo = !!prod.stitchedUrl && /\.(mp4|webm|mov|m3u8)(\?|#|$)/i.test(prod.stitchedUrl);
   const out = el("div", "reelwrap");
   out.style.marginTop = "16px";
   const phone = el("div", "phone");
@@ -1868,6 +2177,7 @@ function renderReel(card, slot, ctx, prod, sc) {
   const meta = el("div", "reelmeta");
   const vo = el("div", "vo");
   vo.append(el("b", null, hasVideo ? `Reel \xB7 ${personaName(a)}'s voice` : `The script \xB7 storyboard`));
+  if (prod.error && prod.status !== "stitch") vo.append(el("div", "note danger", prod.error));
   if (!hasVideo && prod.status !== "stitch") vo.append(el("div", "empty-note", "This is the storyboard. Render each beat into real video with the button above."));
   const ol = el("ol", "beatlines");
   beats.forEach((b, i) => {
@@ -1905,10 +2215,9 @@ function renderReel(card, slot, ctx, prod, sc) {
 }
 async function makeVoice(ctx, textLines) {
   if (!textLines) return null;
-  const a = ctx.account;
   if (!ctx.mock && ctx.relay?.stream) {
     try {
-      const url = await generateSpeech(ctx.relay, textLines, a.assets?.voice?.voiceId);
+      const url = await generateSpeech(ctx.relay, textLines);
       if (url) return { backend: "Higgsfield TTS", play: () => {
         const au = new Audio(url);
         au.play().catch(() => {
@@ -1941,6 +2250,7 @@ async function makeVoice(ctx, textLines) {
 }
 async function genShot(slot, i, ctx) {
   const a = ctx.account, prod = a.productions[slot.id], shot = prod.shots[i];
+  if (!ctx.mock && !ctx.relay) return;
   shot.status = "gen";
   ctx.rerender();
   try {
@@ -1965,27 +2275,25 @@ async function genShot(slot, i, ctx) {
 }
 async function shootAll_(slot, ctx) {
   const prod = ctx.account.productions[slot.id];
-  for (let i = 0; i < prod.shots.length; i++) if (!prod.shots[i].url) await genShot(slot, i, ctx);
+  for (let i = 0; i < prod.shots.length; i++) if (!prod.shots[i].url && prod.shots[i].status !== "gen") await genShot(slot, i, ctx);
 }
 async function driveFromRef(slot, ctx, refUrl) {
   const a = ctx.account, prod = a.productions[slot.id];
-  if (!refUrl) {
-    alert("Paste a reference reel URL to drive from.");
-    return;
-  }
-  if (!a.assets.face?.url) {
-    alert("Approve a face first \u2014 it's the identity we keep.");
-    return;
-  }
+  if (!ctx.mock && !ctx.relay) return;
+  prod.error = null;
   prod.refStatus = "gen";
   prod.status = "stitch";
   prod.refUrl = refUrl;
   ctx.rerender();
+  let out = null;
   try {
     const prompt = `${personaName(a)} \u2014 ${slot.title}. ${slot.angle || ""}`.trim();
-    prod.stitchedUrl = ctx.mock ? (await wait(1100), svgTile("Ref-driven reel", "#C8F250", "#6B4CF0", 288, 512)) : await refDrive(ctx.relay, a.assets.face.url, refUrl, prompt);
+    out = ctx.mock ? (await wait(1100), svgTile("Ref-driven reel", "#C8F250", "#6B4CF0", 288, 512)) : await refDrive(ctx.relay, a.assets.face.url, refUrl, prompt);
   } catch {
+    out = null;
   }
+  if (out) prod.stitchedUrl = out;
+  else if (!ctx.mock) prod.error = "Reference drive failed \u2014 no video came back. Check the reel URL and try again.";
   prod.refStatus = "done";
   prod.status = prod.stitchedUrl ? "done" : "idle";
   ctx.save();
@@ -1993,6 +2301,8 @@ async function driveFromRef(slot, ctx, refUrl) {
 }
 async function stitch_(slot, ctx) {
   const a = ctx.account, prod = a.productions[slot.id];
+  if (!ctx.mock && !ctx.relay) return;
+  prod.error = null;
   prod.status = "stitch";
   ctx.rerender();
   try {
@@ -2000,13 +2310,12 @@ async function stitch_(slot, ctx) {
       await wait(1e3);
       prod.stitchedUrl = prod.shots.find((s) => s.url)?.url || svgTile("Reel", "#FF5A3C", "#6B4CF0", 288, 512);
     } else {
-      const voiceId = a.assets?.voice?.voiceId;
       const face = a.assets?.face?.url;
       const clips = [];
       for (const s of prod.shots.filter((s2) => s2.approved && s2.url)) {
         let audio = null;
         try {
-          if (s.line) audio = await generateSpeech(ctx.relay, s.line, voiceId);
+          if (s.line) audio = await generateSpeech(ctx.relay, s.line);
         } catch {
         }
         let clip = null;
@@ -2022,9 +2331,12 @@ async function stitch_(slot, ctx) {
         }
         if (clip) clips.push(clip);
       }
-      prod.stitchedUrl = clips.length ? await stitchClips(ctx.relay, clips) : prod.shots.find((s) => s.url)?.url || null;
+      const out = clips.length ? await stitchClips(ctx.relay, clips) : null;
+      if (out) prod.stitchedUrl = out;
+      else prod.error = "Rendering failed \u2014 no beat produced a clip. Try again.";
     }
   } catch {
+    prod.error = "Rendering failed \u2014 try again.";
   }
   prod.status = prod.stitchedUrl ? "done" : "idle";
   ctx.save();
@@ -2043,12 +2355,13 @@ function deriveNiche(idea) {
   return /\bai\b|artificial intel|prompt|chatgpt|claude/.test(i) ? "AI apps & how to use them" : /skin|serum|beauty/.test(i) ? "sustainable skincare" : /sneaker|street|hype/.test(i) ? "streetwear & sneakers" : /cook|food|recipe/.test(i) ? "home cooking" : /fit|gym|coach/.test(i) ? "fitness & mobility" : /home|interior|decor/.test(i) ? "home & interiors" : (idea || "lifestyle").split(/\s+/).slice(-2).join(" ");
 }
 function nextDate(a) {
-  const n = (a.calendar.slots || []).length;
-  const day = 3 + n * 3;
-  return `2026-07-${String(Math.min(28, day)).padStart(2, "0")}`;
+  const d = /* @__PURE__ */ new Date();
+  d.setDate(d.getDate() + 3 * ((a.calendar.slots || []).length + 1));
+  return d.toISOString().slice(0, 10);
 }
 function monthShort(m) {
-  return ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"][(parseInt(m, 10) || 7) - 1] || "JUL";
+  const now = (/* @__PURE__ */ new Date()).getMonth() + 1;
+  return ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"][(parseInt(m, 10) || now) - 1] || "";
 }
 var ROUTER = { reference: renderReference, foundation: renderFoundation, assets: renderAssets, calendar: renderCalendar, scripts: renderScripts, produce: renderProduce };
 function renderStage(stageId, root, ctx) {
@@ -2097,13 +2410,18 @@ function mockFacet(facet, a) {
 }
 function mockPlan(a) {
   const n = a.reference.niche || "your niche";
+  const inDays2 = (days) => {
+    const d = /* @__PURE__ */ new Date();
+    d.setDate(d.getDate() + days);
+    return d.toISOString().slice(0, 10);
+  };
   return [
-    { title: `The "skin cycling" backlash`, body: `React to the trend cooling; show your simpler routine.`, chips: ["Myth vs. formulation"], subtitle: "TikTok trends", date: "2026-07-05" },
-    { title: `Ingredient of the month: PDRN`, body: `Explain salmon-DNA serums plainly \u2014 hype?`, chips: ["Label reads"], subtitle: "Google News", date: "2026-07-09" },
-    { title: `A calm 4-step morning`, body: `On-location AM routine in the sunlit bathroom.`, chips: ["Calm routine"], subtitle: "Evergreen", date: "2026-07-12" },
-    { title: `SPF under makeup \u2014 the 3 asks`, body: `Answer the most-DM'd reapplication questions.`, chips: ["Q&A from DMs"], subtitle: "Audience DMs", date: "2026-07-16" },
-    { title: `\u20AC9 dupe vs. the \u20AC40`, body: `Break down why the formulation differs.`, chips: ["Myth vs. formulation"], subtitle: `Reddit`, date: "2026-07-20" },
-    { title: `A day in the lab`, body: `Behind-the-niche: how a small batch is made.`, chips: ["Behind the niche"], subtitle: "Original", date: "2026-07-24" }
+    { title: `The "skin cycling" backlash`, body: `React to the trend cooling; show your simpler routine.`, chips: ["Myth vs. formulation"], subtitle: "TikTok trends", date: inDays2(2) },
+    { title: `Ingredient of the month: PDRN`, body: `Explain salmon-DNA serums plainly \u2014 hype?`, chips: ["Label reads"], subtitle: "Google News", date: inDays2(6) },
+    { title: `A calm 4-step morning`, body: `On-location AM routine in the sunlit bathroom.`, chips: ["Calm routine"], subtitle: "Evergreen", date: inDays2(9) },
+    { title: `SPF under makeup \u2014 the 3 asks`, body: `Answer the most-DM'd reapplication questions.`, chips: ["Q&A from DMs"], subtitle: "Audience DMs", date: inDays2(13) },
+    { title: `\u20AC9 dupe vs. the \u20AC40`, body: `Break down why the formulation differs.`, chips: ["Myth vs. formulation"], subtitle: `Reddit`, date: inDays2(17) },
+    { title: `A day in the lab`, body: `Behind-the-niche: how a small batch is made.`, chips: ["Behind the niche"], subtitle: "Original", date: inDays2(21) }
   ].map((c) => ({ ...c, id: newId() }));
 }
 function mockScript(a, slot) {
@@ -2144,10 +2462,15 @@ function resolve(prompt) {
   if (/spoon|smil|gestur|hook|to camera/.test(p)) return SHOTS.hook;
   return SHOTS.hook;
 }
+var inDays = (days) => {
+  const d = /* @__PURE__ */ new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+};
 function cannedArray(prompt) {
   const p = (prompt || "").toLowerCase();
   if (/pillar/.test(p)) return [{ title: "Genius kitchen tips", body: "A fast, surprising cooking hack per post.", chips: ["knife skills", "pantry swaps"] }, { title: "5-minute meals", body: "One quick recipe, start to plate.", chips: ["weeknight", "one-pan"] }, { title: "Myth vs. method", body: "Debunk a cooking myth on camera.", chips: ["salting pasta water", "resting meat"] }];
-  if (/content plan|posts|calendar|trending/.test(p)) return [{ title: "3 genius cooking tips", body: "Rapid-fire kitchen hacks.", chips: ["Genius kitchen tips"], subtitle: "Trend", date: "2026-07-11" }, { title: "The pan-heat rule", body: "Why oil goes in AFTER the pan is hot.", chips: ["Myth vs. method"], subtitle: "Evergreen", date: "2026-07-15" }];
+  if (/content plan|posts|calendar|trending/.test(p)) return [{ title: "3 genius cooking tips", body: "Rapid-fire kitchen hacks.", chips: ["Genius kitchen tips"], subtitle: "Trend", date: inDays(3) }, { title: "The pan-heat rule", body: "Why oil goes in AFTER the pan is hot.", chips: ["Myth vs. method"], subtitle: "Evergreen", date: inDays(7) }];
   if (/script|beats|shot.*line/.test(p)) return SEED_BEATS.map((b) => ({ title: b.shot, body: b.line }));
   return [{ title: "Nadia Rossi", subtitle: "home cooking & kitchen tips", body: "Warm, practical home cook who makes weeknight food feel easy.", chips: ["warm", "practical", "quick"], recommended: true }];
 }
@@ -2177,7 +2500,7 @@ function seedAccount() {
   a.foundation.more = { pillars: [lock("5-minute meals"), lock("Myth vs. method")] };
   a.assets.face = { url: FACE, status: "done", approved: true, name: "Nadia" };
   a.assets.setting = { url: SETTING, status: "done", approved: true, name: "Bright home kitchen" };
-  a.calendar.slots = [{ id: "s1", date: "2026-07-11", pillar: "Genius kitchen tips", title: "3 genius cooking tips", angle: "Rapid-fire kitchen hacks, part one.", source: "Trend", approved: true, status: "planned" }];
+  a.calendar.slots = [{ id: "s1", date: inDays(3), pillar: "Genius kitchen tips", title: "3 genius cooking tips", angle: "Rapid-fire kitchen hacks, part one.", source: "Trend", approved: true, status: "planned" }];
   a.scripts = { s1: { beats: SEED_BEATS, approved: true, status: "written" } };
   a.productions = {};
   return a;
@@ -2185,7 +2508,7 @@ function seedAccount() {
 function harnessRelay() {
   const store = /* @__PURE__ */ new Map();
   const a = seedAccount();
-  store.set("account:" + a.id, JSON.stringify(a));
+  store.set(ACCOUNT_PREFIX + a.id, JSON.stringify(a));
   return {
     __harness: true,
     identity: async () => ({ name: "Sameep" }),
@@ -2211,12 +2534,16 @@ function harnessRelay() {
 // src/persona.js
 var state = { relay: null, mock: false, caps: null, brand: null, accounts: [], current: null, loading: /* @__PURE__ */ new Set() };
 var HARNESS = new URLSearchParams(location.search).has("harness");
+var FRESH = new URLSearchParams(location.search).has("fresh");
 mountConnect($("sbchip"), {
-  scope: { reason: "Cast \u2014 build AI personas and produce on-model content, stage by stage", tools: ["mcp__claude_ai_Higgsfield__*", "WebSearch", "WebFetch"] },
+  scope: { reason: "Cast \u2014 build AI personas and produce on-model content, stage by stage", tools: ["mcp__claude_ai_Higgsfield__*", "WebSearch", "WebFetch"], contextKinds: ["brand", "persona"] },
   onConnect: (r) => {
     if (!HARNESS) boot(r, false);
   },
   onDisconnect: () => {
+    if (HARNESS || state.mock || !state.relay) return;
+    state.relay = null;
+    setConnBanner(true);
   },
   onProjectChange: () => {
     if (!HARNESS) loadBrand();
@@ -2229,13 +2556,31 @@ else whenRelayReady(1800).then((r) => {
 async function boot(relay, mock) {
   state.relay = relay;
   state.mock = mock;
+  setConnBanner(false);
   state.caps = await (relay.capabilities ? relay.capabilities().catch(() => null) : null);
   $("hero").hidden = true;
   $("app").hidden = false;
   await loadBrand();
   state.accounts = await loadAccounts(relay);
-  if (!state.accounts.length) newAccount();
-  else selectAccount(state.accounts[0].id);
+  if (!state.accounts.length) {
+    if (state.brand) autoStart();
+    else newAccount();
+  } else selectAccount(state.accounts[0].id);
+}
+function autoStart() {
+  newAccount();
+  const a = state.current, b = state.brand, d = b.data || {};
+  const pos = d.positioning || d.tagline || "";
+  a.reference = {
+    brief: `an independent creator making content for ${b.name}${pos ? " \u2014 " + pos : ""}`,
+    niche: d.niche || d.category || "",
+    moodNotes: "",
+    inspirations: [],
+    locked: true
+  };
+  save();
+  go("foundation");
+  groundInBackground({ account: a, relay: state.relay, mock: state.mock, caps: state.caps, save: () => save(a), rerender: renderActiveStage });
 }
 async function loadBrand() {
   try {
@@ -2243,8 +2588,20 @@ async function loadBrand() {
   } catch {
     state.brand = null;
   }
+  if (!state.brand && state.relay && !state.mock) {
+    try {
+      const metas = await state.relay.context.list();
+      const m = (metas || []).find((x) => ["brand", "persona"].includes((x.kind || "").toLowerCase()));
+      if (m) state.brand = await state.relay.context.use(m.id) || null;
+    } catch {
+    }
+  }
   if (state.current && !state.current.brand && state.brand) state.current.brand = state.brand;
   renderBrandBar();
+}
+function setConnBanner(show) {
+  const b = $("connbanner");
+  if (b) b.hidden = !show;
 }
 function renderBrandBar() {
   const box = $("brandbar");
@@ -2298,7 +2655,9 @@ async function pickBrand() {
   }
 }
 function newAccount() {
+  flushSave();
   state.current = blankAccount();
+  state.current.brand = state.brand || null;
   state.loading = /* @__PURE__ */ new Set();
   renderRail();
   renderShell();
@@ -2306,7 +2665,9 @@ function newAccount() {
 function selectAccount(id) {
   const a = state.accounts.find((x) => x.id === id);
   if (!a) return;
+  flushSave();
   state.current = JSON.parse(JSON.stringify(a));
+  if (!state.current.brand && state.brand) state.current.brand = state.brand;
   state.current.stage = reachableStage(state.current);
   state.loading = /* @__PURE__ */ new Set();
   renderRail();
@@ -2314,6 +2675,7 @@ function selectAccount(id) {
 }
 async function duplicateAccount(id, ev) {
   ev?.stopPropagation();
+  flushSave();
   const a = state.accounts.find((x) => x.id === id);
   if (!a) return;
   const copy = JSON.parse(JSON.stringify(a));
@@ -2360,14 +2722,17 @@ function renderShell() {
   renderActiveStage();
 }
 function renderActiveStage() {
+  const account = state.current;
   const ctx = {
-    account: state.current,
+    account,
     relay: state.relay,
     mock: state.mock,
     brand: state.brand,
     caps: state.caps,
     loading: state.loading,
-    save,
+    // save is bound to THIS ctx's account: a stage callback that resolves after an account switch
+    // persists the account it actually mutated, never whatever state.current happens to be then.
+    save: () => save(account),
     rerender: renderActiveStage,
     go
   };
@@ -2380,22 +2745,44 @@ function go(stageId) {
   renderShell();
 }
 var saveT = null;
-async function save() {
+var pendingAcct = null;
+function save(acct) {
+  const a = acct || state.current;
+  if (!a) return;
+  if (pendingAcct && pendingAcct !== a) flushSave();
   renderRail();
   clearTimeout(saveT);
-  saveT = setTimeout(async () => {
-    await persist(state.relay, state.current);
-    state.accounts = await loadAccounts(state.relay);
-    if (!state.accounts.find((a) => a.id === state.current.id)) state.accounts.unshift(state.current);
-    renderRail();
+  pendingAcct = a;
+  saveT = setTimeout(() => {
+    pendingAcct = null;
+    void persistNow(a);
   }, 400);
+}
+async function persistNow(acct) {
+  await persist(state.relay, acct);
+  state.accounts = await loadAccounts(state.relay);
+  if (state.current && !state.accounts.find((a) => a.id === state.current.id)) state.accounts.unshift(state.current);
+  renderRail();
+}
+function flushSave() {
+  if (!pendingAcct) return;
+  clearTimeout(saveT);
+  saveT = null;
+  const acct = pendingAcct;
+  pendingAcct = null;
+  const i = state.accounts.findIndex((x) => x.id === acct.id);
+  if (i >= 0) state.accounts[i] = acct;
+  else state.accounts.unshift(acct);
+  void persist(state.relay, acct);
 }
 $("newAccount").addEventListener("click", newAccount);
 function mockRelay() {
   const store = /* @__PURE__ */ new Map();
   const brand = { id: "aamras", name: "Aamras", kind: "brand", data: { palette: ["#8B1A1A", "#F4A000"] } };
-  const seed = migrate({ id: "maya", name: "Maya Chen", niche: "sustainable skincare", vibe: "warm, plain-spoken, reads every label", story: "ex-lab chemist in Lisbon, small-batch serums", look: { referenceImage: svgTile("Maya", "#FF5A3C", "#FFB05A") }, wardrobe: [{ id: "w1", name: "Linen blazer", referenceImage: svgTile("Linen", "#E8DCC8", "#C9B89A") }], locations: [{ id: "l1", name: "Sunlit bathroom", referenceImage: svgTile("Bathroom", "#BFE3E0", "#7FBFB8") }], cast: [] });
-  store.set("account:" + seed.id, JSON.stringify(seed));
+  if (!FRESH) {
+    const seed = migrate({ id: "maya", name: "Maya Chen", niche: "sustainable skincare", vibe: "warm, plain-spoken, reads every label", story: "ex-lab chemist in Lisbon, small-batch serums", look: { referenceImage: svgTile("Maya", "#FF5A3C", "#FFB05A") }, wardrobe: [{ id: "w1", name: "Linen blazer", referenceImage: svgTile("Linen", "#E8DCC8", "#C9B89A") }], locations: [{ id: "l1", name: "Sunlit bathroom", referenceImage: svgTile("Bathroom", "#BFE3E0", "#7FBFB8") }], cast: [] });
+    store.set(ACCOUNT_PREFIX + seed.id, JSON.stringify(seed));
+  }
   return {
     __mock: true,
     identity: async () => ({ name: "Sameep" }),
